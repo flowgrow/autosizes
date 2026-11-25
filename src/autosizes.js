@@ -34,33 +34,53 @@
   // could get the polyfill to load arbitrary URLs.
   const deferredImages = new Map();
   let didFirstContentfulPaintRun = false;
-  function getSizesValueFromElement(elem) {
-    const width = elem
-      ? Math.round(elem.getBoundingClientRect().width)
-      : 0;
-    if (width <= 0) {
-      return null;
+
+  function getImageSourceWidth(img) {
+    if (!img.getClientRects().length) {
+      return 0;
     }
-    // Set the sizes attribute to the computed width in pixels
-    return `${width}px`;
+
+    const style = getComputedStyle(img);
+    let width = parseFloat(style.width);
+    let height = parseFloat(style.height);
+    if (style.boxSizing === 'border-box') {
+      width -= parseFloat(style.paddingLeft) + parseFloat(style.paddingRight)
+        + parseFloat(style.borderLeftWidth) + parseFloat(style.borderRightWidth);
+      height -= parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+        + parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+    }
+
+    // Use the dimension attributes as the source aspect ratio before loading.
+    const sourceWidth = parseInt(img.getAttribute('width'), 10);
+    const sourceHeight = parseInt(img.getAttribute('height'), 10);
+    const aspectRatio = sourceWidth / sourceHeight;
+    if (!(width > 0 && height > 0 && sourceWidth > 0 && sourceHeight > 0)
+      || !Number.isFinite(aspectRatio)) {
+      return width;
+    }
+
+    const fittedWidth = height * aspectRatio;
+    if (style.objectFit === 'cover') {
+      return Math.max(width, fittedWidth);
+    }
+    if (style.objectFit === 'contain' || style.objectFit === 'scale-down') {
+      return Math.min(width, fittedWidth);
+    }
+    return width;
   }
-  function calculateAndSetSizes(img) {
-    // Calculate the displayed width of the image
-    // getBoundingClientRect() forces layout, but this is running right after FCP,
-    // so hopefully the DOM is not dirty.
-    let sizes = getSizesValueFromElement(img);
-    if (!sizes) {
-      // If we get no width for the image, use the parent's width
-      sizes = getSizesValueFromElement(img.parentElement);
+
+  function calculateSizes(img) {
+    let width = getImageSourceWidth(img);
+    if (!(width > 0)) {
+      width = img.parentElement?.getBoundingClientRect().width;
     }
-    if (sizes) {
-      img.sizes = sizes;
-    }
+    return width > 0 && Number.isFinite(width) ? `${width}px` : null;
   }
 
   // Store the original src and srcset attributes, and remove them to prevent loading before
   // we've calculated the sizes attribute
   function preventNonAutoImageLoad(images) {
+    const measuredSizes = new Map();
     for (const img of images) {
       if (img.complete) {
         // Don't do any of this if the image is already loaded
@@ -88,16 +108,31 @@
         deferredImages.set(img, originalAttributes);
       } else {
         // Calculate sizes without removing src and srcset
-        calculateAndSetSizes(img);
+        if (!measuredSizes.has(img)) {
+          measuredSizes.set(img, calculateSizes(img));
+        }
+      }
+    }
+    for (const [img, sizes] of measuredSizes) {
+      if (sizes) {
+        img.sizes = sizes;
       }
     }
   }
 
   // Set the sizes attribute to the computed width in pixels and restore original src and srcset
   function restoreImageAttributes() {
-    for (const [img, originalAttributes] of deferredImages) {
-      calculateAndSetSizes(img);
+    // Read every image's layout before changing sizes or restoring sources.
+    const measuredSizes = Array.from(deferredImages.keys(), (img) => [
+      img,
+      calculateSizes(img),
+    ]);
+    for (const [img, sizes] of measuredSizes) {
+      if (sizes) {
+        img.sizes = sizes;
+      }
 
+      const originalAttributes = deferredImages.get(img);
       for (const attribute of attributes) {
         if (attribute in originalAttributes) {
           img[attribute] = originalAttributes[attribute];
