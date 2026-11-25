@@ -1,29 +1,35 @@
-(function () {
-  // Check if the browser already supports sizes="auto"
-  // We're using UA sniffing here, as there's no way to detect browser
-  // support without a forced layout, which would make things slower for everyone.
-  const polyfillAutoSizes = () => {
-    // Avoid polyfilling if the browser is too old and doesn't support performance observer and paint timing
-    if (
-      !('PerformanceObserver' in window) ||
-      !PerformanceObserver.supportedEntryTypes.includes('paint')
-    ) {
-      return false;
-    }
-
-    const userAgent = navigator.userAgent;
-    const chromeMatch = userAgent.match(/Chrome\/(\d+)/);
-
-    if (!chromeMatch) {
-      return true;
-    }
-
-    const chromeVersion = parseInt(chromeMatch[1], 10);
-    return chromeVersion < 126;
-  };
-
-  if (!polyfillAutoSizes()) {
+(async function () {
+  if (
+    !('PerformanceObserver' in window) ||
+    !PerformanceObserver.supportedEntryTypes.includes('paint')
+  ) {
     return;
+  }
+
+  const probe = document.createElement('img');
+  probe.style.setProperty('display', 'none', 'important');
+  probe.style.setProperty('contain', 'revert', 'important');
+  probe.sizes = 'auto';
+  document.documentElement.append(probe);
+  const hasNativeAutoSizes = getComputedStyle(probe).contain === 'size';
+  probe.remove();
+
+  if (hasNativeAutoSizes) {
+    // Blink gates explicit two-dimensional sizes and object-fit-aware auto
+    // sizing together. Test the parser on the detached image to avoid layout.
+    probe.width = 40;
+    probe.height = 20;
+    probe.sizes = 'cover 10px 10px, 7px';
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"/>';
+    probe.srcset = `data:image/svg+xml,${encodeURIComponent(svg)} 40w`;
+    try {
+      await probe.decode();
+      if (probe.naturalWidth === 20) {
+        return;
+      }
+    } catch {
+      // A blocked or failed probe leaves the object-fit correction enabled.
+    }
   }
 
   const attributes = ['src', 'srcset'];
@@ -35,12 +41,26 @@
   const deferredImages = new Map();
   let didFirstContentfulPaintRun = false;
 
+  function isLazyAutoSized(img) {
+    return /^auto\s*(?:,|$)/i.test(img.sizes.trim())
+      && img.getAttribute('loading')?.toLowerCase() === 'lazy';
+  }
+
+  function canCorrectNativeSizing(img) {
+    return isLazyAutoSized(img) && img.srcset
+      && img.hasAttribute('width') && img.hasAttribute('height');
+  }
+
   function getImageSourceWidth(img) {
+    const style = getComputedStyle(img);
+    const {objectFit} = style;
+    if (hasNativeAutoSizes && !['cover', 'contain', 'scale-down'].includes(objectFit)) {
+      return null;
+    }
     if (!img.getClientRects().length) {
       return 0;
     }
 
-    const style = getComputedStyle(img);
     let width = parseFloat(style.width);
     let height = parseFloat(style.height);
     if (style.boxSizing === 'border-box') {
@@ -56,22 +76,22 @@
     const aspectRatio = sourceWidth / sourceHeight;
     if (!(width > 0 && height > 0 && sourceWidth > 0 && sourceHeight > 0)
       || !Number.isFinite(aspectRatio)) {
-      return width;
+      return hasNativeAutoSizes ? null : width;
     }
 
     const fittedWidth = height * aspectRatio;
-    if (style.objectFit === 'cover') {
-      return Math.max(width, fittedWidth);
+    let adjustedWidth = width;
+    if (objectFit === 'cover') {
+      adjustedWidth = Math.max(width, fittedWidth);
+    } else if (objectFit === 'contain' || objectFit === 'scale-down') {
+      adjustedWidth = Math.min(width, fittedWidth);
     }
-    if (style.objectFit === 'contain' || style.objectFit === 'scale-down') {
-      return Math.min(width, fittedWidth);
-    }
-    return width;
+    return hasNativeAutoSizes && adjustedWidth === width ? null : adjustedWidth;
   }
 
   function calculateSizes(img) {
     let width = getImageSourceWidth(img);
-    if (!(width > 0)) {
+    if (!hasNativeAutoSizes && !(width > 0)) {
       width = img.parentElement?.getBoundingClientRect().width;
     }
     return width > 0 && Number.isFinite(width) ? `${width}px` : null;
@@ -82,18 +102,19 @@
   function preventNonAutoImageLoad(images) {
     const measuredSizes = new Map();
     for (const img of images) {
-      if (img.complete) {
+      if (!hasNativeAutoSizes && img.complete) {
         // Don't do any of this if the image is already loaded
         continue;
       }
       // Only process images with sizes attribute starting with "auto" and loading="lazy"
-      if (
-        !(img.getAttribute('sizes') || '').trim().startsWith('auto') ||
-        img.getAttribute('loading') !== 'lazy'
-      ) {
+      if (hasNativeAutoSizes ? !canCorrectNativeSizing(img) : !isLazyAutoSized(img)) {
         continue;
       }
       if (!didFirstContentfulPaintRun) {
+        if (hasNativeAutoSizes) {
+          deferredImages.set(img, null);
+          continue;
+        }
         // Merge with any values stored by a previous pass over this image
         const originalAttributes =
           deferredImages.get(img) || Object.create(null);
@@ -125,7 +146,7 @@
     // Read every image's layout before changing sizes or restoring sources.
     const measuredSizes = Array.from(deferredImages.keys(), (img) => [
       img,
-      calculateSizes(img),
+      !hasNativeAutoSizes || canCorrectNativeSizing(img) ? calculateSizes(img) : null,
     ]);
     for (const [img, sizes] of measuredSizes) {
       if (sizes) {
@@ -134,7 +155,7 @@
 
       const originalAttributes = deferredImages.get(img);
       for (const attribute of attributes) {
-        if (attribute in originalAttributes) {
+        if (originalAttributes && attribute in originalAttributes) {
           img[attribute] = originalAttributes[attribute];
         }
       }
@@ -186,7 +207,7 @@
 
   // Prevent the load of any existing images when the polyfill loads.
   preventNonAutoImageLoad(
-    document.querySelectorAll('img[sizes^="auto"][loading="lazy"]'),
+    document.querySelectorAll('img[sizes^="auto" i][loading="lazy" i]'),
   );
 
   new PerformanceObserver((entries, observer) => {
